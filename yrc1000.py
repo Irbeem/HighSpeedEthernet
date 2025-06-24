@@ -521,6 +521,44 @@ class YRC1000:
         value = response[32:64].decode('ascii').rstrip('\x00')
         return value
 
+    # --- File Commands (Port 10041) ---
+
+    # 1. List all files
+    def list_files(self):
+        data = b''  # empty data request
+        response = self._send_command(0x0001, data=data, file_mode=True)
+        if response[20] != 0x00:
+            raise Exception("List Files Error: " + response.hex())
+        file_list = response[32:].decode('ascii').split('\x00')
+        files = [f for f in file_list if f]
+        return files
+
+    # 2. Save Job (Download job from robot)
+    def save_job(self, jobname):
+        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
+        response = self._send_command(0x0003, data=jobname_padded, file_mode=True)
+        if response[20] != 0x00:
+            raise Exception("Save Job Error: " + response.hex())
+        filedata = response[32:]  # Job file data
+        return filedata
+
+    # 3. Load Job (Upload job into robot)
+    def load_job(self, jobname, filedata):
+        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
+        data = jobname_padded + filedata
+        response = self._send_command(0x0004, data=data, file_mode=True)
+        if response[20] != 0x00:
+            raise Exception("Load Job Error: " + response.hex())
+        return True
+
+    # 4. Delete Job
+    def delete_job(self, jobname):
+        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
+        response = self._send_command(0x0005, data=jobname_padded, file_mode=True)
+        if response[20] != 0x00:
+        raise Exception("Delete Job Error: " + response.hex())
+        return True
+
     def close(self):
         self.control_sock.close()
         self.file_sock.close()
