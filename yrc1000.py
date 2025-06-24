@@ -522,42 +522,129 @@ class YRC1000:
         return value
 
     # --- File Commands (Port 10041) ---
-
-    # 1. List all files
-    def list_files(self):
-        data = b''  # empty data request
-        response = self._send_command(0x0001, data=data, file_mode=True)
+    def list_files(self, pattern="*.*"):
+        # File List : Command No=0x00, Service=0x32
+        if pattern == "*.*":
+            data = b'*.*\x00'
+        else:
+            data = pattern.encode('ascii').ljust(4, b'\x00')
+        request = self._build_request(command_no=0x00, service=0x32, data=data)
+        self.file_sock.sendto(request, (self.ip, self.file_port))
+        response, _ = self.file_sock.recvfrom(65535)
         if response[20] != 0x00:
-            raise Exception("List Files Error: " + response.hex())
+            raise Exception("File List Error: " + response.hex())
         file_list = response[32:].decode('ascii').split('\x00')
         files = [f for f in file_list if f]
         return files
 
-    # 2. Save Job (Download job from robot)
-    def save_job(self, jobname):
-        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
-        response = self._send_command(0x0003, data=jobname_padded, file_mode=True)
+    def delete_file(self, filename):
+        # File Delete : Command No=0x00, Service=0x09
+        name_bytes = filename.encode('ascii').ljust(256, b'\x00')
+        request = self._build_request(command_no=0x00, service=0x09, data=name_bytes)
+        self.file_sock.sendto(request, (self.ip, self.file_port))
+        response, _ = self.file_sock.recvfrom(65535)
         if response[20] != 0x00:
-            raise Exception("Save Job Error: " + response.hex())
-        filedata = response[32:]  # Job file data
-        return filedata
-
-    # 3. Load Job (Upload job into robot)
-    def load_job(self, jobname, filedata):
-        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
-        data = jobname_padded + filedata
-        response = self._send_command(0x0004, data=data, file_mode=True)
-        if response[20] != 0x00:
-            raise Exception("Load Job Error: " + response.hex())
+            raise Exception("File Delete Error: " + response.hex())
         return True
 
-    # 4. Delete Job
-    def delete_job(self, jobname):
-        jobname_padded = jobname.encode('ascii').ljust(32, b'\x00')
-        response = self._send_command(0x0005, data=jobname_padded, file_mode=True)
-        if response[20] != 0x00:
-        raise Exception("Delete Job Error: " + response.hex())
+    def save_file(self, filename):
+        # File Save (Download) : Command No=0x00, Service=0x16
+        name_bytes = filename.encode('ascii').ljust(256, b'\x00')
+        request = self._build_request(command_no=0x00, service=0x16, data=name_bytes)
+        self.file_sock.sendto(request, (self.ip, self.file_port))
+
+        file_data = bytearray()
+        expected_block = 1
+
+        while True:
+            response, _ = self.file_sock.recvfrom(65535)
+            block_no = struct.unpack('<I', response[12:16])[0]
+            is_last = (block_no & 0x80000000) != 0
+            block_index = block_no & 0x7FFFFFFF
+
+            if block_index != expected_block:
+                raise Exception(f"Unexpected block number: {block_index} (expected {expected_block})")
+
+            data_payload = response[32 + 10:]  # Header + service header offset
+            file_data.extend(data_payload)
+
+            ack = self._build_ack(block_no)
+            self.file_sock.sendto(ack, (self.ip, self.file_port))
+
+            if is_last:
+                break
+
+            expected_block += 1
+
+        return bytes(file_data)
+
+    def load_file(self, filename, filedata, block_size=512):
+        # File Load (Upload) : Command No=0x00, Service=0x15
+        name_bytes = filename.encode('ascii').ljust(256, b'\x00')
+        request = self._build_request(command_no=0x00, service=0x15, data=name_bytes)
+        self.file_sock.sendto(request, (self.ip, self.file_port))
+
+        total_blocks = (len(filedata) + block_size - 1) // block_size
+
+        for block_index in range(total_blocks):
+            block_no = block_index + 1
+            is_last = (block_index == total_blocks - 1)
+            block_no_field = block_no | (0x80000000 if is_last else 0x00000000)
+
+            header = self._build_data_header(block_no_field,
+                                             len(filedata[block_index * block_size:(block_index + 1) * block_size]))
+            service_header = struct.pack('<B B B B H', 0x96, 0x00, 0x00, 0x00, 0x0000)
+            payload = filedata[block_index * block_size:(block_index + 1) * block_size]
+            packet = header + service_header + payload
+
+            self.file_sock.sendto(packet, (self.ip, self.file_port))
+
+            response, _ = self.file_sock.recvfrom(65535)
+            resp_block_no = struct.unpack('<I', response[12:16])[0]
+            if (resp_block_no & 0x7FFFFFFF) != block_no:
+                raise Exception(f"ACK mismatch: expected {block_no} got {resp_block_no}")
+
         return True
+
+    def _build_ack(self, block_no):
+        identifier = b'YERC'
+        header_size = 0x0020
+        data_size = 0x0000
+        reserve1 = 0x03
+        processing_division = 0x02
+        ack = 0x01
+        request_id = self.request_id % 256
+        reserve2 = b'99999999'
+
+        header = struct.pack(
+            '<4s H H B B B B I 8s',
+            identifier, header_size, data_size,
+            reserve1, processing_division, ack, request_id,
+            block_no, reserve2
+        )
+        sub_header = struct.pack('<H H B B H', 0x16, 0x00, 0x00, 0x00, 0x00)
+        self.request_id += 1
+        return header + sub_header
+
+    def _build_data_header(self, block_no, data_size):
+        identifier = b'YERC'
+        header_size = 0x0020
+        full_data_size = data_size + 10  # service header size
+        reserve1 = 0x03
+        processing_division = 0x02
+        ack = 0x01
+        request_id = self.request_id % 256
+        reserve2 = b'99999999'
+
+        header = struct.pack(
+            '<4s H H B B B B I 8s',
+            identifier, header_size, full_data_size,
+            reserve1, processing_division, ack, request_id,
+            block_no, reserve2
+        )
+        self.request_id += 1
+        return header
+
 
     def close(self):
         self.control_sock.close()
